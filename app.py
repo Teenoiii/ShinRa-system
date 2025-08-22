@@ -154,7 +154,7 @@ def login_page():
                     st.error("ชื่อผู้ใช้นี้มีอยู่แล้ว")
 
     # Demo account info
-    st.info("บัญชีทดสอบ: admin / admin123 (ผู้จัดการ)")
+    # st.info("บัญชีทดสอบ: admin / admin123 (ผู้จัดการ)")
 
 # User dashboard
 def user_dashboard():
