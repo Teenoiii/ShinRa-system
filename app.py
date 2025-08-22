@@ -205,10 +205,12 @@ def request_item_tab():
             if qty > item[1]:
                 st.error(f"ขอได้สูงสุด {item[1]} สำหรับ {item[0]}")
             else:
-                conn.execute('INSERT INTO requests (user_id, item_id, qty, reason, status) VALUES (?,?,?,?,?)',
-                           (st.session_state.user_id, item_id, qty, reason, 'pending'))
+                cur = conn.execute(
+                    'INSERT INTO requests (user_id, item_id, qty, reason, status) VALUES (?,?,?,?,?)',
+                    (st.session_state.user_id, item_id, qty, reason, 'pending')
+                )
                 conn.commit()
-                last_id = conn.lastrowid
+                last_id = cur.lastrowid        
                 conn.close()
                 
                 st.success(f"📝 สร้างคำขอ #{last_id} ขอเบิก **{item[0]}** จำนวน {qty} (รออนุมัติ)")
@@ -261,7 +263,7 @@ def return_item_tab():
                 conn.close()
                 
                 new_remaining = remaining - return_qty
-                st.success(f"↩️ คืนสินค้าคำขอ #{request_id} • {req[8]} จำนวน {return_qty} {'(คืนครบแล้ว)' if new_remaining == 0 else ''}")
+                st.success(f"↩️ คืนสินค้าคำขอ #{request_id} • {req[9]} จำนวน {return_qty} {'(คืนครบแล้ว)' if new_remaining == 0 else ''}")
 
 # Donate item tab
 def donate_item_tab():
