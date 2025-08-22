@@ -6,7 +6,7 @@ import hashlib
 import os, random, time
 from contextlib import closing
 import io, csv
-
+from pathlib import Path
 
 
 # ---------------- Database setup ----------------
@@ -151,7 +151,23 @@ def init_db():
 
     conn.close()
 
-
+def show_image_safe(img_path: str, width: int = 120, caption: str | None = None):
+    """แสดงรูปจาก URL หรือไฟล์โลคัล; ถ้าไฟล์ไม่มีจะไม่ throw error"""
+    if not img_path:
+        return
+    try:
+        if img_path.startswith(("http://", "https://")):
+            show_image_safe()(img_path, width=width, caption=caption)
+            return
+        p = Path(img_path)
+        if not p.exists():
+            p = Path(".") / img_path  # ลองคลังปัจจุบัน
+        if p.exists():
+            show_image_safe()(str(p), width=width, caption=caption)
+        else:
+            st.caption(f"ไม่พบรูป: {img_path}")
+    except Exception:
+        st.caption("แสดงรูปไม่สำเร็จ")
 
 # ---------------- Session token (persist after F5) ----------------
 import uuid
@@ -583,7 +599,7 @@ def spin_wheel_tab():
     if flash:
         getattr(st, flash_ty)(flash)
     if flash_img:
-        st.image(flash_img, caption="รางวัลรอบล่าสุด", width=IMG_SIZE)
+        show_image_safe(img_path, width=IMG_SIZE, caption="รางวัลรอบล่าสุด")
 
     # เครดิต
     credit = get_credit(int(st.session_state.user_id), wheel_id)
@@ -621,11 +637,11 @@ def spin_wheel_tab():
                     if img:
                         try:
                             if img.startswith(("http://", "https://")):
-                                st.image(img, width=IMG_SIZE)
+                                show_image_safe()(img, width=IMG_SIZE)
                             elif os.path.exists(img):
-                                st.image(img, width=IMG_SIZE)
+                                show_image_safe()(img, width=IMG_SIZE)
                             elif os.path.exists(os.path.join(".", img)):
-                                st.image(os.path.join(".", img), width=IMG_SIZE)
+                                show_image_safe()(os.path.join(".", img), width=IMG_SIZE)
                         except:
                             st.caption("แสดงรูปไม่สำเร็จ")
                     st.markdown(f"**{label or name}**")
@@ -796,7 +812,7 @@ def wheel_admin_tab():
 
                 with col2:
                     if img:
-                        st.image(img, width=120)
+                        show_image_safe(img, width=120)
                     st.caption("อัปโหลดไฟล์หรือใส่ลิงก์รูปก็ได้")
                     up = st.file_uploader("อัปโหลดรูป", type=["png","jpg","jpeg","webp"], key=f"up_{wid}")
                     new_img = st.text_input("หรือวาง URL/path รูป", value=img, key=f"wimg_{wid}")
@@ -810,7 +826,7 @@ def wheel_admin_tab():
                             f.write(up.read())
                         new_img = save_path
                         st.success("บันทึกรูปแล้ว")
-                        st.image(new_img, width=120)
+                        show_image_safe()(new_img, width=120)
 
                 c = st.columns(3)
                 if c[0].button("💾 บันทึก", key=f"wsv_{wid}"):
