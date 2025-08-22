@@ -4,12 +4,10 @@ import pandas as pd
 from datetime import datetime
 import hashlib
 
-# Database setup
+# ---------------- Database setup ----------------
 def init_db():
     conn = sqlite3.connect('storebot.db', check_same_thread=False)
     conn.execute('PRAGMA foreign_keys = ON')
-    
-    # Create tables
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,12 +27,15 @@ def init_db():
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- ✅ ใส่คอลัมน์ให้ครบตั้งแต่แรก
     CREATE TABLE IF NOT EXISTS donations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT NOT NULL,
       item_id INTEGER NOT NULL,
       qty INTEGER NOT NULL CHECK (qty > 0),
       note TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+      approved_by TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -45,22 +46,79 @@ def init_db():
       role TEXT NOT NULL DEFAULT 'user'
     );
     ''')
-    
-    # Create default admin user if not exists
+    # ✅ migration เผื่อเครื่องที่มีตารางเก่า
+    try:
+        conn.execute("ALTER TABLE donations ADD COLUMN status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected'))")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE donations ADD COLUMN approved_by TEXT")
+    except:
+        pass
+
     try:
         admin_password = hashlib.sha256('admin123'.encode()).hexdigest()
-        conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                    ('admin', admin_password, 'manager'))
+        conn.execute('INSERT INTO users (username, password, role) VALUES (?,?,?)',
+                     ('admin', admin_password, 'manager'))
         conn.commit()
     except:
-        pass  # Admin user already exists
-    
+        pass
     conn.close()
 
-# Helper functions
+
+# ---------------- Session token (persist after F5) ----------------
+import uuid
+from datetime import timedelta
+
 def get_db_connection():
     return sqlite3.connect('storebot.db', check_same_thread=False)
 
+def create_session(user_id, ttl_minutes=1440):
+    """Create a persistent session token and store in DB."""
+    token = uuid.uuid4().hex
+    expires_at = (datetime.utcnow() + timedelta(minutes=ttl_minutes)).isoformat(timespec='seconds')
+    conn = get_db_connection()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    ''')
+    conn.execute('INSERT OR REPLACE INTO sessions (token, user_id, expires_at) VALUES (?,?,?)',
+                 (token, str(user_id), expires_at))
+    conn.commit()
+    conn.close()
+    return token
+
+def get_user_by_token(token: str):
+    if not token:
+        return None
+    conn = get_db_connection()
+    row = conn.execute('''
+        SELECT s.user_id, u.username, u.role, s.expires_at
+        FROM sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.token = ?
+    ''', (token,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        if datetime.fromisoformat(row[3]) < datetime.utcnow():
+            return None
+    except:
+        return None
+    return (str(row[0]), row[1], row[2])  # (user_id, username, role)
+
+def clear_session(token: str):
+    if not token:
+        return
+    conn = get_db_connection()
+    conn.execute('DELETE FROM sessions WHERE token = ?', (token,))
+    conn.commit()
+    conn.close()
+
+# ---------------- Helpers ----------------
 def format_thai_datetime(datetime_str):
     try:
         dt = datetime.fromisoformat(datetime_str.replace(' ', 'T'))
@@ -72,7 +130,7 @@ def authenticate_user(username, password):
     conn = get_db_connection()
     hashed_password = hashlib.sha256(password.encode()).hexdigest()
     user = conn.execute('SELECT * FROM users WHERE username = ? AND password = ?',
-                       (username, hashed_password)).fetchone()
+                        (username, hashed_password)).fetchone()
     conn.close()
     return user
 
@@ -80,8 +138,8 @@ def create_user(username, password, role='user'):
     conn = get_db_connection()
     try:
         hashed_password = hashlib.sha256(password.encode()).hexdigest()
-        conn.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                    (username, hashed_password, role))
+        conn.execute('INSERT INTO users (username, password, role) VALUES (?,?,?)',
+                     (username, hashed_password, role))
         conn.commit()
         conn.close()
         return True
@@ -89,20 +147,13 @@ def create_user(username, password, role='user'):
         conn.close()
         return False
 
-# Status mapping
 TH_STATUS = {'pending': 'รออนุมัติ', 'approved': 'อนุมัติแล้ว', 'rejected': 'ปฏิเสธแล้ว'}
 
-# Initialize database
+# ---------------- Init ----------------
 init_db()
+st.set_page_config(page_title="ระบบจัดการคลังสินค้า", page_icon="📦", layout="wide")
 
-# Streamlit app configuration
-st.set_page_config(
-    page_title="ระบบจัดการคลังสินค้า",
-    page_icon="📦",
-    layout="wide"
-)
-
-# Session state initialization
+# Session state init
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'user_id' not in st.session_state:
@@ -112,18 +163,18 @@ if 'username' not in st.session_state:
 if 'role' not in st.session_state:
     st.session_state.role = None
 
-# Login/Register page
+# ---------------- UI: Login/Register ----------------
 def login_page():
     st.title("🔐 เข้าสู่ระบบ")
-    
+
     tab1, tab2 = st.tabs(["เข้าสู่ระบบ", "สมัครสมาชิก"])
-    
+
     with tab1:
         with st.form("login_form"):
             username = st.text_input("ชื่อผู้ใช้")
             password = st.text_input("รหัสผ่าน", type="password")
             submit = st.form_submit_button("เข้าสู่ระบบ")
-            
+
             if submit:
                 user = authenticate_user(username, password)
                 if user:
@@ -131,18 +182,26 @@ def login_page():
                     st.session_state.user_id = str(user[0])
                     st.session_state.username = user[1]
                     st.session_state.role = user[3]
+
+                    # ✅ สร้างโทเคนและใส่ลง URL เพื่อทนต่อ F5/cold start
+                    token = create_session(st.session_state.user_id)
+                    try:
+                        st.query_params.update({"auth": token})
+                    except Exception:
+                        st.experimental_set_query_params(auth=token)
+
                     st.success("เข้าสู่ระบบสำเร็จ!")
                     st.rerun()
                 else:
                     st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
-    
+
     with tab2:
         with st.form("register_form"):
             new_username = st.text_input("ชื่อผู้ใช้ใหม่")
             new_password = st.text_input("รหัสผ่าน", type="password")
             confirm_password = st.text_input("ยืนยันรหัสผ่าน", type="password")
             register_submit = st.form_submit_button("สมัครสมาชิก")
-            
+
             if register_submit:
                 if new_password != confirm_password:
                     st.error("รหัสผ่านไม่ตรงกัน")
@@ -153,72 +212,54 @@ def login_page():
                 else:
                     st.error("ชื่อผู้ใช้นี้มีอยู่แล้ว")
 
-    # Demo account info
-    # st.info("บัญชีทดสอบ: admin / admin123 (ผู้จัดการ)")
-
-# User dashboard
+# ---------------- UI: User dashboard ----------------
 def user_dashboard():
     st.title("📦 ระบบเบิก-คืนสินค้า")
     st.write(f"สวัสดี **{st.session_state.username}**!")
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["🔥 ขอเบิก", "🔄 คืนของ", "💸 ส่งเงินแก๊ง", "📊 สถานะ"])
-    
-    with tab1:
-        request_item_tab()
-    
-    with tab2:
-        return_item_tab()
-    
-    with tab3:
-        donate_item_tab()
-    
-    with tab4:
-        status_tab()
 
-# Request item tab
+    tab1, tab2, tab3, tab4 = st.tabs(["🔥 ขอเบิก", "🔄 คืนของ", "💸 ส่งเงินแก๊ง", "📊 สถานะ"])
+    with tab1: request_item_tab()
+    with tab2: return_item_tab()
+    with tab3: donate_item_tab()
+    with tab4: status_tab()
+
 def request_item_tab():
     st.header("🔥 ขอเบิกสินค้า")
-    
     conn = get_db_connection()
     items = conn.execute('SELECT id, name, stock FROM items ORDER BY stock DESC').fetchall()
     conn.close()
-    
+
     if not items:
         st.warning("ยังไม่มีรายการสินค้า")
         return
-    
+
     with st.form("request_form"):
         item_options = {f"{item[1]} (คงเหลือ {item[2]})": item[0] for item in items}
         selected_item = st.selectbox("เลือกสินค้าที่ต้องการเบิก", options=list(item_options.keys()))
         qty = st.number_input("จำนวนที่ต้องการ", min_value=1, value=1)
         reason = st.text_area("เหตุผล (ไม่บังคับ)")
-        
         submit = st.form_submit_button("ส่งคำขอ")
-        
+
         if submit:
             item_id = item_options[selected_item]
-            
-            # Check stock
             conn = get_db_connection()
             item = conn.execute('SELECT name, stock FROM items WHERE id = ?', (item_id,)).fetchone()
-            
             if qty > item[1]:
                 st.error(f"ขอได้สูงสุด {item[1]} สำหรับ {item[0]}")
+                conn.close()
             else:
                 cur = conn.execute(
                     'INSERT INTO requests (user_id, item_id, qty, reason, status) VALUES (?,?,?,?,?)',
                     (st.session_state.user_id, item_id, qty, reason, 'pending')
                 )
                 conn.commit()
-                last_id = cur.lastrowid        
+                last_id = cur.lastrowid
                 conn.close()
-                
                 st.success(f"📝 สร้างคำขอ #{last_id} ขอเบิก **{item[0]}** จำนวน {qty} (รออนุมัติ)")
+                st.rerun()  # ✅ เห็นรายการทันที
 
-# Return item tab
 def return_item_tab():
     st.header("🔄 คืนสินค้า")
-    
     conn = get_db_connection()
     requests = conn.execute('''
         SELECT r.id, it.name, r.qty, r.returned_qty
@@ -227,82 +268,80 @@ def return_item_tab():
         ORDER BY r.id DESC
     ''', (st.session_state.user_id,)).fetchall()
     conn.close()
-    
+
     if not requests:
         st.info("คุณไม่มีคำขอที่ค้างอยู่สำหรับคืนสินค้า")
         return
-    
+
     with st.form("return_form"):
         request_options = {}
         for req in requests:
             remaining = req[2] - req[3]
             request_options[f"#{req[0]} • {req[1]} (คืนได้อีก {remaining})"] = req[0]
-        
+
         selected_request = st.selectbox("เลือกคำขอที่จะคืนสินค้า", options=list(request_options.keys()))
         return_qty = st.number_input("จำนวนที่จะคืน", min_value=1, value=1)
-        
         submit = st.form_submit_button("คืนสินค้า")
-        
+
         if submit:
             request_id = request_options[selected_request]
-            
             conn = get_db_connection()
             req = conn.execute('''
                 SELECT r.*, it.name FROM requests r JOIN items it ON it.id = r.item_id
                 WHERE r.id = ? AND r.user_id = ?
             ''', (request_id, st.session_state.user_id)).fetchone()
-            
+
             remaining = req[3] - req[6]  # qty - returned_qty
-            
             if return_qty > remaining:
                 st.error(f"คืนได้สูงสุด {remaining}")
+                conn.close()
             else:
                 conn.execute('UPDATE items SET stock = stock + ? WHERE id = ?', (return_qty, req[2]))
                 conn.execute('UPDATE requests SET returned_qty = returned_qty + ? WHERE id = ?', (return_qty, request_id))
                 conn.commit()
                 conn.close()
-                
                 new_remaining = remaining - return_qty
                 st.success(f"↩️ คืนสินค้าคำขอ #{request_id} • {req[9]} จำนวน {return_qty} {'(คืนครบแล้ว)' if new_remaining == 0 else ''}")
+                st.rerun()  # ✅ อัปเดตทันที
 
-# Donate item tab
 def donate_item_tab():
-    st.header("💸 ส่งเงินแก๊ง")
-    
+    st.header("💸 ส่งเงินแก๊ง (รออนุมัติ)")
+
     conn = get_db_connection()
     items = conn.execute('SELECT id, name, stock FROM items ORDER BY name').fetchall()
     conn.close()
-    
+
     if not items:
         st.warning("ยังไม่มีรายการสินค้า")
         return
-    
+
     with st.form("donate_form"):
         item_options = {f"{item[1]} (คงเหลือ {item[2]})": item[0] for item in items}
-        selected_item = st.selectbox("เลือกสินค้าที่จะเพิ่มเข้าสต๊อก", options=list(item_options.keys()))
+        selected_item = st.selectbox("เลือกสินค้าที่จะส่งเข้าแก๊ง", options=list(item_options.keys()))
         qty = st.number_input("จำนวนที่จะส่ง", min_value=1, value=1)
         note = st.text_area("บันทึก/หมายเหตุ (ไม่บังคับ)")
-        
-        submit = st.form_submit_button("ส่งเงินแก๊ง")
-        
+
+        submit = st.form_submit_button("ส่งคำขอเติมสต๊อก")
+
         if submit:
             item_id = item_options[selected_item]
-            
             conn = get_db_connection()
-            item_name = conn.execute('SELECT name FROM items WHERE id = ?', (item_id,)).fetchone()[0]
-            
-            conn.execute('UPDATE items SET stock = stock + ? WHERE id = ?', (qty, item_id))
-            conn.execute('INSERT INTO donations (user_id, item_id, qty, note) VALUES (?,?,?,?)',
-                        (st.session_state.user_id, item_id, qty, note))
+            # บันทึกเป็น pending รอแอดมินอนุมัติ
+            cur = conn.execute(
+                'INSERT INTO donations (user_id, item_id, qty, note, status) VALUES (?,?,?,?,?)',
+                (st.session_state.user_id, item_id, qty, note, 'pending')
+            )
             conn.commit()
+            rid = cur.lastrowid
+            item_name = conn.execute('SELECT name FROM items WHERE id = ?', (item_id,)).fetchone()[0]
             conn.close()
-            
-            st.success(f"✅ ส่งเข้าแก๊งเรียบร้อย • **{item_name}** จำนวน **{qty}**")
 
-# Status tab
+            st.success(f"📝 สร้างคำขอเติมสต๊อก #{rid} • {item_name} × {qty} (รออนุมัติ)")
+            st.rerun()
+
+
 def status_tab():
     st.header("📊 สถานะคำขอของคุณ")
-    
     conn = get_db_connection()
     requests = conn.execute('''
         SELECT r.id, it.name, r.qty, r.returned_qty, r.status, r.created_at
@@ -312,46 +351,61 @@ def status_tab():
         LIMIT 20
     ''', (st.session_state.user_id,)).fetchall()
     conn.close()
-    
+
     if not requests:
         st.info("คุณยังไม่มีประวัติการขอเบิก")
         return
-    
+
     df = pd.DataFrame(requests, columns=['ID', 'สินค้า', 'จำนวน', 'คืนแล้ว', 'สถานะ', 'วันที่สร้าง'])
     df['สถานะ'] = df['สถานะ'].map(TH_STATUS)
     df['วันที่สร้าง'] = df['วันที่สร้าง'].apply(format_thai_datetime)
-    
     st.dataframe(df, use_container_width=True)
 
-# Admin dashboard
+    st.markdown("---")
+    st.subheader("ประวัติส่งเงินแก๊ง/เติมสต๊อกของฉัน")
+    conn = get_db_connection()
+    dons = conn.execute('''
+        SELECT d.id, it.name, d.qty, d.status, d.created_at
+        FROM donations d JOIN items it ON it.id = d.item_id
+        WHERE d.user_id = ?
+        ORDER BY d.id DESC
+        LIMIT 20
+    ''', (st.session_state.user_id,)).fetchall()
+    conn.close()
+
+    if dons:
+        df2 = pd.DataFrame(dons, columns=['ID','สินค้า','จำนวน','สถานะ','วันที่สร้าง'])
+        df2['สถานะ'] = df2['สถานะ'].map({'pending':'รออนุมัติ','approved':'อนุมัติแล้ว','rejected':'ปฏิเสธแล้ว'})
+        df2['วันที่สร้าง'] = df2['วันที่สร้าง'].apply(format_thai_datetime)
+        st.dataframe(df2, use_container_width=True)
+    else:
+        st.info("ยังไม่มีประวัติส่งเงินแก๊ง")
+
+# ---------------- UI: Admin ----------------
 def admin_dashboard():
     st.title("🛠 แผงผู้ดูแล (StoreManager)")
     st.write(f"สวัสดี **{st.session_state.username}** (ผู้จัดการ)")
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["➕ เพิ่มสินค้า", "🔍 ตรวจคำขอ", "📦 สต๊อก", "⚙️ จัดการ"])
-    
-    with tab1:
-        add_item_tab()
-    
-    with tab2:
-        review_requests_tab()
-    
-    with tab3:
-        stock_tab()
-    
-    with tab4:
-        manage_items_tab()
 
-# Add item tab (admin)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "➕ เพิ่มสินค้า",
+        "🔍 ตรวจคำขอ",
+        "🧾 ตรวจคำขอเติมสต๊อก",
+        "📦 สต๊อก",
+        "⚙️ จัดการ",
+    ])
+    with tab1: add_item_tab()
+    with tab2: review_requests_tab()
+    with tab3: review_donations_tab()
+    with tab4: stock_tab()
+    with tab5: manage_items_tab()
+
+
 def add_item_tab():
     st.header("➕ เพิ่มสินค้าใหม่")
-    
     with st.form("add_item_form"):
         name = st.text_input("ชื่อสินค้า")
         stock = st.number_input("สต๊อกเริ่มต้น", min_value=0, value=0)
-        
         submit = st.form_submit_button("เพิ่มสินค้า")
-        
         if submit:
             if not name.strip():
                 st.error("กรุณาใส่ชื่อสินค้า")
@@ -362,117 +416,112 @@ def add_item_tab():
                     conn.commit()
                     conn.close()
                     st.success(f"✅ เพิ่มสินค้า **{name}** (สต๊อก {stock})")
+                    st.rerun()
                 except sqlite3.IntegrityError:
                     conn.close()
                     st.error("มีชื่อสินค้านี้อยู่แล้ว")
 
-# Review requests tab (admin)
+# optional auto-refresh for admin request queue
 def review_requests_tab():
     st.header("🔍 ตรวจสอบคำขอ")
-    
+
+    # ทางเลือก: เปิดใช้ auto-refresh ทุก 5 วิ (ต้องติดตั้ง streamlit-extras)
+    try:
+        from streamlit_extras.app_refresh import st_autorefresh
+        st_autorefresh(interval=5000, key="auto_refresh_requests")
+    except Exception:
+        pass  # ถ้าไม่ได้ติดตั้ง จะข้ามไป
+
     conn = get_db_connection()
     pending_requests = conn.execute('''
-        SELECT r.id, r.qty, r.user_id, r.reason, it.name, it.stock, u.username
+        SELECT r.id, r.qty, r.user_id, r.reason, it.name, it.stock, u.username, it.id
         FROM requests r 
         JOIN items it ON it.id = r.item_id
         JOIN users u ON u.id = r.user_id
         WHERE r.status = 'pending'
         ORDER BY r.id ASC
     ''').fetchall()
-    
+
     if not pending_requests:
         st.info("ไม่มีคำขอค้าง")
         conn.close()
         return
-    
+
     for req in pending_requests:
-        req_id, qty, user_id, reason, item_name, item_stock, username = req
-        
+        req_id, qty, user_id, reason, item_name, item_stock, username, item_id = req
         with st.container():
             st.write(f"**คำขอ #{req_id}**")
             col1, col2, col3 = st.columns([2, 1, 1])
-            
+
             with col1:
                 st.write(f"• ผู้ขอ: {username}")
                 st.write(f"• สินค้า: **{item_name}** x{qty}")
                 st.write(f"• เหตุผล: {reason or '-'}")
                 st.write(f"• สต๊อกปัจจุบัน: {item_stock}")
-            
+
             with col2:
                 if st.button("✅ อนุมัติ", key=f"approve_{req_id}"):
                     if item_stock >= qty:
-                        conn.execute('UPDATE items SET stock = stock - ? WHERE name = ?', (qty, item_name))
+                        # ใช้ id แทน name เพื่อความปลอดภัย
+                        conn.execute('UPDATE items SET stock = stock - ? WHERE id = ?', (qty, item_id))
                         conn.execute('UPDATE requests SET status = ?, approved_by = ? WHERE id = ?',
-                                   ('approved', st.session_state.user_id, req_id))
+                                     ('approved', st.session_state.user_id, req_id))
                         conn.commit()
                         st.success(f"อนุมัติคำขอ #{req_id}")
                         st.rerun()
                     else:
                         st.error("สต๊อกไม่พอ")
-            
+
             with col3:
                 if st.button("❌ ปฏิเสธ", key=f"reject_{req_id}"):
                     conn.execute('UPDATE requests SET status = ? WHERE id = ?', ('rejected', req_id))
                     conn.commit()
                     st.success(f"ปฏิเสธคำขอ #{req_id}")
                     st.rerun()
-            
+
             st.divider()
-    
     conn.close()
 
-# Stock tab (admin)
 def stock_tab():
     st.header("📦 สต๊อกปัจจุบัน")
-    
     conn = get_db_connection()
     items = conn.execute('SELECT id, name, stock FROM items ORDER BY stock DESC, name ASC').fetchall()
     conn.close()
-    
+
     if not items:
         st.warning("ยังไม่มีรายการสินค้า")
         return
-    
+
     df = pd.DataFrame(items, columns=['ID', 'ชื่อสินค้า', 'คงเหลือ'])
     st.dataframe(df, use_container_width=True)
-    
-    # Stock summary
+
     total_items = len(items)
     low_stock = sum(1 for item in items if item[2] <= 5)
-    
     col1, col2 = st.columns(2)
-    with col1:
-        st.metric("รายการสินค้าทั้งหมด", total_items)
-    with col2:
-        st.metric("สินค้าใกล้หมด (≤5)", low_stock)
+    with col1: st.metric("รายการสินค้าทั้งหมด", total_items)
+    with col2: st.metric("สินค้าใกล้หมด (≤5)", low_stock)
 
-# Manage items tab (admin)
 def manage_items_tab():
     st.header("⚙️ จัดการสินค้า")
-    
     conn = get_db_connection()
     items = conn.execute('SELECT id, name, stock FROM items ORDER BY name ASC').fetchall()
-    
     if not items:
         st.warning("ยังไม่มีรายการสินค้า")
         conn.close()
         return
-    
+
     for item in items:
         item_id, name, stock = item
-        
         with st.expander(f"📦 {name} (คงเหลือ {stock})"):
             col1, col2 = st.columns(2)
-            
             with col1:
                 new_name = st.text_input("ชื่อใหม่", value=name, key=f"name_{item_id}")
                 new_stock = st.number_input("สต๊อกใหม่", value=stock, min_value=0, key=f"stock_{item_id}")
-                
                 if st.button("💾 บันทึก", key=f"save_{item_id}"):
                     if new_name.strip():
                         try:
                             conn.execute('UPDATE items SET name = ?, stock = ? WHERE id = ?',
-                                       (new_name.strip(), new_stock, item_id))
+                                         (new_name.strip(), new_stock, item_id))
                             conn.commit()
                             st.success("บันทึกแล้ว")
                             st.rerun()
@@ -480,13 +529,9 @@ def manage_items_tab():
                             st.error("ชื่อสินค้าซ้ำ")
                     else:
                         st.error("ชื่อสินค้าห้ามว่าง")
-            
             with col2:
                 st.write(f"ID: {item_id}")
-                
-                # Check if item has related requests
                 related_requests = conn.execute('SELECT COUNT(*) FROM requests WHERE item_id = ?', (item_id,)).fetchone()[0]
-                
                 if related_requests > 0:
                     st.warning(f"มีประวัติคำขอ {related_requests} รายการ")
                 else:
@@ -495,27 +540,107 @@ def manage_items_tab():
                         conn.commit()
                         st.success(f"ลบ {name} แล้ว")
                         st.rerun()
-    
     conn.close()
 
-# Main app
+def review_donations_tab():
+    st.header("🧾 ตรวจคำขอเติมสต๊อก")
+    # auto-refresh (มีได้/ไม่มีได้)
+    try:
+        from streamlit_extras.app_refresh import st_autorefresh
+        st_autorefresh(interval=5000, key="auto_refresh_donations")
+    except Exception:
+        pass
+
+    conn = get_db_connection()
+    rows = conn.execute('''
+        SELECT d.id, u.username, it.name, d.qty, d.note, d.created_at, it.id
+        FROM donations d
+        JOIN users u ON u.id = d.user_id
+        JOIN items it ON it.id = d.item_id
+        WHERE d.status = 'pending'
+        ORDER BY d.id ASC
+    ''').fetchall()
+
+    if not rows:
+        st.info("ไม่มีคำขอเติมสต๊อกค้าง")
+        conn.close()
+        return
+
+    for r in rows:
+        did, username, item_name, qty, note, created_at, item_id = r
+        with st.container():
+            st.write(f"**คำขอเติมสต๊อก #{did}**")
+            st.write(f"• ผู้ส่ง: {username}")
+            st.write(f"• สินค้า: **{item_name}** × {qty}")
+            st.write(f"• เหตุผล/หมายเหตุ: {note or '-'}")
+            st.write(f"• เวลา: {format_thai_datetime(created_at)}")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ อนุมัติ", key=f"approve_donation_{did}"):
+                    # อนุมัติแล้วค่อยเพิ่มสต๊อก
+                    conn.execute('UPDATE items SET stock = stock + ? WHERE id = ?', (qty, item_id))
+                    conn.execute("UPDATE donations SET status = 'approved', approved_by = ? WHERE id = ?",
+                                 (st.session_state.user_id, did))
+                    conn.commit()
+                    st.success(f"อนุมัติคำขอเติมสต๊อก #{did} (+{qty})")
+                    st.rerun()
+            with c2:
+                if st.button("❌ ปฏิเสธ", key=f"reject_donation_{did}"):
+                    conn.execute("UPDATE donations SET status = 'rejected', approved_by = ? WHERE id = ?",
+                                 (st.session_state.user_id, did))
+                    conn.commit()
+                    st.success(f"ปฏิเสธคำขอเติมสต๊อก #{did}")
+                    st.rerun()
+
+            st.divider()
+
+    conn.close()
+
+
+# ---------------- Main ----------------
 def main():
+    # 1) Auto-login จาก query param ?auth=
+    try:
+        qp = st.query_params
+        token = qp.get("auth", None)
+        if isinstance(token, list):
+            token = token[0] if token else None
+    except Exception:
+        token = st.experimental_get_query_params().get("auth", [None])[0]
+
+    if not st.session_state.get("logged_in") and token:
+        u = get_user_by_token(token)
+        if u:
+            st.session_state.logged_in = True
+            st.session_state.user_id, st.session_state.username, st.session_state.role = u
+
+    # 2) Route
     if not st.session_state.logged_in:
         login_page()
     else:
-        # Sidebar with user info and logout
         with st.sidebar:
             st.write(f"👤 {st.session_state.username}")
             st.write(f"🎭 {st.session_state.role}")
-            
             if st.button("🚪 ออกจากระบบ"):
+                # ลบโทเคนและล้างพารามิเตอร์ใน URL
+                try:
+                    qp = st.query_params
+                    token = qp.get("auth", None)
+                except Exception:
+                    token = st.experimental_get_query_params().get("auth", [None])[0]
+                clear_session(token)
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    st.experimental_set_query_params()  # เคลียร์ทั้งหมด
+
                 st.session_state.logged_in = False
                 st.session_state.user_id = None
                 st.session_state.username = None
                 st.session_state.role = None
                 st.rerun()
-        
-        # Main content based on user role
+
         if st.session_state.role == 'manager':
             admin_dashboard()
         else:
