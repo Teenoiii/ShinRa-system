@@ -386,18 +386,21 @@ def admin_dashboard():
     st.title("🛠 แผงผู้ดูแล (StoreManager)")
     st.write(f"สวัสดี **{st.session_state.username}** (ผู้จัดการ)")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "➕ เพิ่มสินค้า",
-        "🔍 ตรวจคำขอ",
+        "🔍 ตรวจคำขอเบิก",
         "🧾 ตรวจคำขอเติมสต๊อก",
         "📦 สต๊อก",
         "⚙️ จัดการ",
+        "🗂 ประวัติทั้งหมด",       
     ])
     with tab1: add_item_tab()
     with tab2: review_requests_tab()
     with tab3: review_donations_tab()
     with tab4: stock_tab()
     with tab5: manage_items_tab()
+    with tab6: all_logs_tab()        
+
 
 
 def add_item_tab():
@@ -543,7 +546,7 @@ def manage_items_tab():
     conn.close()
 
 def review_donations_tab():
-    st.header("🧾 ตรวจคำขอเติมสต๊อก")
+    st.header("🧾 ตรวจคำขอส่งเงินแก๊ง")
     # auto-refresh (มีได้/ไม่มีได้)
     try:
         from streamlit_extras.app_refresh import st_autorefresh
@@ -596,6 +599,119 @@ def review_donations_tab():
             st.divider()
 
     conn.close()
+
+def all_logs_tab():
+    import sqlite3
+    st.header("🗂 ประวัติทั้งหมด (Transaction Logs)")
+
+    # ---------- Filters ----------
+    col1, col2, col3 = st.columns([1,1,1.2])
+    with col1:
+        date_range = st.date_input("ช่วงวันที่", value=None)
+    with col2:
+        types = st.multiselect("ประเภท", ["เบิกสินค้า", "เติมสต๊อก"], default=["เบิกสินค้า", "เติมสต๊อก"])
+    with col3:
+        statuses = st.multiselect("สถานะ", ["รออนุมัติ", "อนุมัติแล้ว", "ปฏิเสธแล้ว"], default=[])
+
+    q = st.text_input("ค้นหา (ชื่อผู้ใช้/ชื่อสินค้า/หมายเหตุ)", value="").strip()
+
+    # ---------- Load ----------
+    conn = get_db_connection()
+
+    # requests (เบิก)
+    req_rows = conn.execute('''
+        SELECT r.id, r.created_at, u.username, it.name, r.qty, r.status, r.approved_by,
+               'เบิกสินค้า' AS type, r.reason AS note
+        FROM requests r
+        JOIN users u ON u.id = r.user_id
+        JOIN items it ON it.id = r.item_id
+        ORDER BY r.id DESC
+    ''').fetchall()
+
+    # donations (เติม)
+    try:
+        don_rows = conn.execute('''
+            SELECT d.id, d.created_at, u.username, it.name, d.qty, d.status, d.approved_by,
+                   'เติมสต๊อก' AS type, d.note AS note
+            FROM donations d
+            JOIN users u ON u.id = d.user_id
+            JOIN items it ON it.id = d.item_id
+            ORDER BY d.id DESC
+        ''').fetchall()
+    except sqlite3.OperationalError:
+        # fallback ถ้าตาราง donations เก่ายังไม่มี status/approved_by
+        don_rows = conn.execute('''
+            SELECT d.id, d.created_at, u.username, it.name, d.qty,
+                   'approved' as status, NULL as approved_by,
+                   'เติมสต๊อก' AS type, d.note AS note
+            FROM donations d
+            JOIN users u ON u.id = d.user_id
+            JOIN items it ON it.id = d.item_id
+            ORDER BY d.id DESC
+        ''').fetchall()
+
+    conn.close()
+
+    import pandas as pd
+    df_req = pd.DataFrame(req_rows, columns=["ID","วันที่","ผู้ใช้","สินค้า","จำนวน","สถานะ","ผู้อนุมัติ","ประเภท","หมายเหตุ"])
+    df_don = pd.DataFrame(don_rows, columns=["ID","วันที่","ผู้ใช้","สินค้า","จำนวน","สถานะ","ผู้อนุมัติ","ประเภท","หมายเหตุ"])
+
+    df = pd.concat([df_req, df_don], ignore_index=True)
+    if df.empty:
+        st.info("ยังไม่มีประวัติรายการ")
+        return
+
+    # แปลงสถานะภาษาไทยสำหรับแสดงผล/กรอง
+    map_th = {"pending":"รออนุมัติ","approved":"อนุมัติแล้ว","rejected":"ปฏิเสธแล้ว"}
+    df["สถานะ(TH)"] = df["สถานะ"].map(map_th).fillna(df["สถานะ"])
+    # แปลงเวลา
+    df["วันที่"] = df["วันที่"].apply(format_thai_datetime)
+
+    # ---------- Apply filters ----------
+    # ประเภท
+    if types:
+        df = df[df["ประเภท"].isin(types)]
+    # สถานะ
+    if statuses:
+        df = df[df["สถานะ(TH)"].isin(statuses)]
+    # ช่วงวัน (ลดรูป: เทียบแค่ date ส่วนหน้า)
+    if date_range:
+        if isinstance(date_range, tuple) or isinstance(date_range, list):
+            start = date_range[0]
+            end = date_range[-1]
+        else:
+            start = end = date_range
+        # แปลงคอลัมน์ "วันที่" ที่เป็น text ไทยกลับเป็นวันที่สำหรับเทียบช่วง
+        def to_date(s):
+            try:
+                # s รูปแบบ dd/mm/YYYY HH:MM:SS
+                return datetime.strptime(s, "%d/%m/%Y %H:%M:%S").date()
+            except:
+                return None
+        df_dates = df["วันที่"].apply(to_date)
+        mask = (df_dates >= start) & (df_dates <= end)
+        df = df[mask]
+
+    # คีย์เวิร์ด
+    if q:
+        q_lower = q.lower()
+        df = df[df.apply(lambda r:
+                         q_lower in str(r["ผู้ใช้"]).lower() or
+                         q_lower in str(r["สินค้า"]).lower() or
+                         q_lower in str(r["หมายเหตุ"]).lower() or
+                         q_lower in str(r["ID"]).lower()
+                         , axis=1)]
+
+    # ---------- Show ----------
+    show_df = df[["ID","ประเภท","ผู้ใช้","สินค้า","จำนวน","สถานะ(TH)","ผู้อนุมัติ","วันที่","หมายเหตุ"]].copy()
+    show_df = show_df.sort_values(by=["วันที่","ID"], ascending=[False, False]).reset_index(drop=True)
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    # ดาวน์โหลด CSV
+    csv = show_df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ ดาวน์โหลด CSV (ประวัติทั้งหมด)", data=csv,
+                       file_name="all_transactions.csv", mime="text/csv", use_container_width=True)
+
 
 
 # ---------------- Main ----------------
