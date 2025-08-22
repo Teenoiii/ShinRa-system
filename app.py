@@ -3,12 +3,84 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import hashlib
+import os, random, time
+from contextlib import closing
+import io, csv
+
+
 
 # ---------------- Database setup ----------------
 def init_db():
     conn = sqlite3.connect('storebot.db', check_same_thread=False)
     conn.execute('PRAGMA foreign_keys = ON')
     conn.executescript('''
+    CREATE TABLE IF NOT EXISTS wheel_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id INTEGER NOT NULL,
+        label TEXT,
+        image_url TEXT,
+        weight REAL NOT NULL CHECK(weight > 0),
+        qty_per_spin INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_spins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        wheel_item_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (wheel_item_id) REFERENCES wheel_items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS spin_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        tokens INTEGER NOT NULL DEFAULT 0
+    );
+                       
+    CREATE TABLE IF NOT EXISTS wheel (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL DEFAULT 'Default Wheel',
+        is_active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS wheel_item (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wheel_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        label TEXT,
+        weight REAL NOT NULL,
+        reward_qty INTEGER NOT NULL DEFAULT 1,
+        image_path TEXT,
+        is_enabled INTEGER NOT NULL DEFAULT 1,
+        FOREIGN KEY (wheel_id) REFERENCES wheel(id),
+        FOREIGN KEY (item_id) REFERENCES items(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS user_spin_credit (
+        user_id INTEGER NOT NULL,
+        wheel_id INTEGER NOT NULL,
+        credit INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, wheel_id),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (wheel_id) REFERENCES wheel(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS wheel_spin_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        wheel_id INTEGER NOT NULL,
+        item_id INTEGER,
+        reward_qty INTEGER,
+        before_stock INTEGER,
+        after_stock INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (wheel_id) REFERENCES wheel(id),
+        FOREIGN KEY (item_id) REFERENCES items(id)
+    );
+
+
     CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
@@ -52,6 +124,10 @@ def init_db():
         role TEXT NOT NULL DEFAULT 'user'
     );
     ''')
+    # seed default wheel
+    if conn.execute("SELECT COUNT(*) FROM wheel").fetchone()[0] == 0:
+        conn.execute("INSERT INTO wheel(name, is_active) VALUES(?,1)", ("Default Wheel",))
+        conn.commit()
 
     # migrate กันพัง (กรณี donations เก่า)
     try:
@@ -71,6 +147,8 @@ def init_db():
         conn.commit()
     except:
         pass
+
+
     conn.close()
 
 
@@ -128,6 +206,107 @@ def clear_session(token: str):
     conn.close()
 
 # ---------------- Helpers ----------------
+def weighted_choice(rows):
+    """rows: list of dicts with keys: item_id, weight, reward_qty, stock"""
+    total = sum(max(0.0, r["weight"]) for r in rows)
+    if total <= 0:
+        return None
+    r = random.random() * total
+    acc = 0.0
+    for row in rows:
+        acc += max(0.0, row["weight"])
+        if acc >= r:
+            return row
+    return rows[-1]
+
+def ensure_assets_dir():
+    os.makedirs("wheel_assets", exist_ok=True)
+    return "wheel_assets"
+
+def add_credit(user_id:int, wheel_id:int, delta:int):
+    with closing(get_db_connection()) as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO user_spin_credit(user_id, wheel_id, credit)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id, wheel_id) DO UPDATE SET credit = credit + ?
+        """, (user_id, wheel_id, max(0,delta), delta))
+        con.commit()
+
+def get_credit(user_id:int, wheel_id:int)->int:
+    with closing(get_db_connection()) as con:
+        row = con.execute("SELECT credit FROM user_spin_credit WHERE user_id=? AND wheel_id=?",
+                          (user_id, wheel_id)).fetchone()
+        return row[0] if row else 0
+
+def spin_once(user_id:int, wheel_id:int=1):
+    """ทำธุรกรรมหมุนแบบ atomic เบื้องต้น"""
+    con = get_db_connection()
+    con.isolation_level = "EXCLUSIVE"
+    cur = con.cursor()
+    try:
+        cur.execute("BEGIN")
+        # เครดิต
+        row = cur.execute("SELECT credit FROM user_spin_credit WHERE user_id=? AND wheel_id=?",
+                          (user_id, wheel_id)).fetchone()
+        credit = row[0] if row else 0
+        if credit <= 0:
+            con.rollback()
+            return {"ok": False, "msg": "เครดิตหมุนไม่พอ"}
+
+        # รายการที่สต๊อกพอและเปิดใช้งาน
+        rows = cur.execute("""
+            SELECT wi.item_id, wi.weight, wi.reward_qty, it.stock
+            FROM wheel_item wi
+            JOIN items it ON it.id = wi.item_id
+            WHERE wi.wheel_id=? AND wi.is_enabled=1 AND it.stock >= wi.reward_qty
+        """, (wheel_id,)).fetchall()
+        items_avail = [{"item_id":r[0], "weight":r[1], "reward_qty":r[2], "stock":r[3]} for r in rows]
+
+        if not items_avail:
+            con.rollback()
+            return {"ok": False, "msg": "ของในวงล้อไม่พอในสต๊อก"}
+
+        chosen = weighted_choice(items_avail)
+        if not chosen:
+            con.rollback()
+            return {"ok": False, "msg": "ไม่สามารถสุ่มได้"}
+
+        item_id = chosen["item_id"]
+        qty = int(chosen["reward_qty"])
+
+        # หักเครดิต (ป้องกันแข่งกันอัปเดต)
+        cur.execute("""
+            UPDATE user_spin_credit SET credit = credit - 1
+            WHERE user_id=? AND wheel_id=? AND credit > 0
+        """, (user_id, wheel_id))
+        if cur.rowcount == 0:
+            con.rollback()
+            return {"ok": False, "msg": "เครดิตหมดแล้ว"}
+
+        # ตัดสต๊อก
+        before = cur.execute("SELECT stock FROM items WHERE id=?", (item_id,)).fetchone()[0]
+        if before < qty:
+            con.rollback()
+            return {"ok": False, "msg": "สต๊อกไม่พอขณะทำรายการ"}
+        cur.execute("UPDATE items SET stock = stock - ? WHERE id=?", (qty, item_id))
+        after = before - qty
+
+        # บันทึกประวัติ
+        cur.execute("""
+            INSERT INTO wheel_spin_history(user_id, wheel_id, item_id, reward_qty, before_stock, after_stock)
+            VALUES(?,?,?,?,?,?)
+        """, (user_id, wheel_id, item_id, qty, before, after))
+
+        con.commit()
+        return {"ok": True, "item_id": item_id, "qty": qty, "stock_after": after}
+    except Exception as e:
+        try: con.rollback()
+        except: pass
+        return {"ok": False, "msg": f"error: {e}"}
+    finally:
+        con.close()
+
 def format_thai_datetime(datetime_str):
     try:
         dt = datetime.fromisoformat(datetime_str.replace(' ', 'T'))
@@ -226,11 +405,13 @@ def user_dashboard():
     st.title("📦 ระบบเบิก-คืนสินค้า")
     st.write(f"สวัสดี **{st.session_state.username}**!")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🔥 ขอเบิก", "🔄 คืนของ", "💸 ส่งเงินแก๊ง", "📊 สถานะ"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 ขอเบิก", "🔄 คืนของ", "💸 ส่งเงินแก๊ง", "🎡 สุ่มไอเทม", "📊 สถานะ"])
     with tab1: request_item_tab()
     with tab2: return_item_tab()
     with tab3: donate_item_tab()
-    with tab4: status_tab()
+    with tab4: spin_wheel_tab()     
+    with tab5: status_tab()
+
 
 def request_item_tab():
     st.header("🔥 ขอเบิกสินค้า")
@@ -311,7 +492,7 @@ def return_item_tab():
                 new_remaining = remaining - return_qty
                 st.success(f"↩️ คืนสินค้าคำขอ #{request_id} • {req[9]} จำนวน {return_qty} {'(คืนครบแล้ว)' if new_remaining == 0 else ''}")
                 st.rerun()
-                
+
 def donate_item_tab():
     st.header("💸 ส่งเงินแก๊ง (รออนุมัติ)")
 
@@ -389,25 +570,349 @@ def status_tab():
     else:
         st.info("ยังไม่มีประวัติส่งเงินแก๊ง")
 
+IMG_SIZE = 120   # <<< กำหนดขนาดรูปมาตรฐานตรงนี้
+
+def spin_wheel_tab():
+    st.header("🎡 สุ่มไอเทม")
+    wheel_id = 1
+
+    # === Flash จากรอบก่อน (ข้อความ + รูป) ===
+    flash     = st.session_state.pop("spin_flash", None)
+    flash_ty  = st.session_state.pop("spin_flash_type", "success")
+    flash_img = st.session_state.pop("spin_flash_img", None)
+    if flash:
+        getattr(st, flash_ty)(flash)
+    if flash_img:
+        st.image(flash_img, caption="รางวัลรอบล่าสุด", width=IMG_SIZE)
+
+    # เครดิต
+    credit = get_credit(int(st.session_state.user_id), wheel_id)
+    c1, c2 = st.columns([1, 1])
+    with c1: st.metric("สิทธิ์หมุนคงเหลือ", credit)
+    # with c2: st.caption("ระบบจะสุ่มเฉพาะรายการที่ **สต๊อกเพียงพอ** เท่านั้น")
+
+    # โหลดรายการบนวงล้อ
+    with closing(get_db_connection()) as con:
+        rows = con.execute("""
+            SELECT wi.id, it.name, wi.weight, wi.reward_qty, it.stock,
+                   COALESCE(wi.label,''), COALESCE(wi.image_path,''), wi.item_id
+            FROM wheel_item wi
+            JOIN items it ON it.id = wi.item_id
+            WHERE wi.wheel_id=? AND wi.is_enabled=1
+            ORDER BY it.name
+        """, (wheel_id,)).fetchall()
+
+        ok_rows = con.execute("""
+            SELECT wi.weight, wi.reward_qty, it.stock, COALESCE(wi.label,''), it.name, COALESCE(wi.image_path,'')
+            FROM wheel_item wi JOIN items it ON it.id=wi.item_id
+            WHERE wi.wheel_id=? AND wi.is_enabled=1 AND it.stock >= wi.reward_qty
+        """, (wheel_id,)).fetchall()
+
+    # === การ์ดไอเทม ===
+    st.markdown("### รายการในวงล้อ")
+    if rows:
+        total_w = sum(max(0.0, r[0]) for r in ok_rows) or 1.0
+        grid = st.columns(3)
+        for i, r in enumerate(rows):
+            _, name, w, qty, stock, label, img, _ = r
+            pct = (w / total_w) * 100.0 if stock >= qty and w > 0 and total_w > 0 else 0
+            with grid[i % 3]:
+                with st.container(border=True):
+                    if img:
+                        try:
+                            if img.startswith(("http://", "https://")):
+                                st.image(img, width=IMG_SIZE)
+                            elif os.path.exists(img):
+                                st.image(img, width=IMG_SIZE)
+                            elif os.path.exists(os.path.join(".", img)):
+                                st.image(os.path.join(".", img), width=IMG_SIZE)
+                        except:
+                            st.caption("แสดงรูปไม่สำเร็จ")
+                    st.markdown(f"**{label or name}**")
+                    st.caption(f"โอกาศอยู่ในมือคุณ ผีพนันทั้งหลาย")
+                    # st.caption(f"โอกาศได้: {w:g} %")
+                    # st.progress(min(int(pct), 100), text=f"โอกาศได้ : {pct:.2f}%")
+    else:
+        st.info("ยังไม่มีรายการบนวงล้อ")
+
+    st.divider()
+
+        # === ปุ่มหมุน ===
+    ph_img, ph_text, ph_prog = st.empty(), st.empty(), st.empty()
+    ph_flash = st.empty()  # ✅ placeholder สำหรับ flash ข้อความ/รูป
+
+    candidates = [{"label": r[5] or r[1], "image": r[6] or ""} for r in rows]
+
+    if st.button("🎰 หมุนเลย", type="primary", disabled=(credit <= 0), use_container_width=True):
+        if not candidates:
+            ph_flash.warning("ไม่มีรายการให้สุ่ม หรือสต๊อกไม่เพียงพอ")
+        else:
+            spins, base, step = 28, 0.05, 0.015
+            for i in range(spins):
+                pick = random.choice(candidates)
+                # if pick["image"]:
+                #     try: ph_img.image(pick["image"], width=IMG_SIZE)
+                #     except: ph_img.empty()
+                ph_text.markdown(f"## 🎲 {pick['label']}")
+                ph_prog.progress(int((i+1)/spins*100), text="กำลังหมุน…")
+                time.sleep(base + step*i)
+
+            ph_text.markdown("## ✅ กำลังตัดสต๊อก…")
+
+            # ทำธุรกรรมสุ่มจริง
+            res = spin_once(int(st.session_state.user_id), wheel_id)
+            if res.get("ok"):
+                with closing(get_db_connection()) as con:
+                    it  = con.execute("SELECT name FROM items WHERE id=?", (res["item_id"],)).fetchone()
+                    img = con.execute("SELECT COALESCE(image_path,'') FROM wheel_item WHERE wheel_id=? AND item_id=? AND is_enabled=1 ORDER BY id DESC LIMIT 1",
+                                      (wheel_id, res["item_id"])).fetchone()
+                won = it[0] if it else f"ID {res['item_id']}"
+                img_path = (img[0] if img else "") or ""
+
+                # ✅ แสดงผลลัพธ์ตรงนี้เลย ไม่ต้อง rerun
+                ph_flash.success(f"คุณได้ **{won}** × {res['qty']} (สต๊อกคงเหลือ {res['stock_after']})")
+                if img_path:
+                    ph_flash.image(img_path, width=IMG_SIZE, caption="รางวัลรอบล่าสุด")
+
+                st.balloons()
+            else:
+                ph_flash.error(res.get("msg", "สุ่มไม่สำเร็จ"))
+
+
+    st.divider()
+    
+    # === ประวัติ ===
+    # === ปุ่มลบประวัติของฉัน ===
+    with st.expander("🗑️ ล้างประวัติการหมุนของฉัน", expanded=False):
+        st.caption("เหมาะสำหรับล้างข้อมูลตอนเทส ฟีเจอร์นี้ลบเฉพาะประวัติของบัญชีที่กำลังล็อกอินอยู่")
+        colx, coly = st.columns([1,1])
+        with colx:
+            confirm = st.checkbox("ฉันยืนยันว่าจะลบประวัติเหล่านี้ทั้งหมด", key="clear_my_spin_confirm")
+        with coly:
+            really = st.selectbox("พิมพ์/เลือกคำว่า YES เพื่อยืนยัน", ["", "YES"], key="clear_my_spin_yes")
+
+        if st.button("ลบประวัติของฉันทันที", type="secondary", use_container_width=True,
+                    disabled=not(confirm and really == "YES")):
+            with closing(get_db_connection()) as con:
+                con.execute(
+                    "DELETE FROM wheel_spin_history WHERE user_id=? AND wheel_id=?",
+                    (int(st.session_state.user_id), 1)  # 1 = wheel_id ของคุณ
+                )
+                con.commit()
+            st.success("ลบประวัติการหมุนของคุณเรียบร้อยแล้ว")
+            st.rerun()
+
+    st.markdown("### 🗂 ประวัติการหมุนของฉัน")
+    limit = st.slider("จำนวนแถวที่แสดง", 10, 200, 50, 10)
+    with closing(get_db_connection()) as con:
+        hist = con.execute("""
+            SELECT h.created_at, i.name, h.reward_qty, h.before_stock, h.after_stock, COALESCE(wi.image_path,'')
+            FROM wheel_spin_history h
+            LEFT JOIN items i ON i.id=h.item_id
+            LEFT JOIN wheel_item wi ON wi.item_id=h.item_id AND wi.wheel_id=h.wheel_id
+            WHERE h.user_id=? AND h.wheel_id=?
+            ORDER BY h.id DESC LIMIT ?
+        """, (int(st.session_state.user_id), wheel_id, int(limit))).fetchall()
+
+    if hist:
+        data = [{
+            "เวลา": format_thai_datetime(r[0]) if 'format_thai_datetime' in globals() else r[0],
+            "ไอเทม": r[1] or "-",
+            "จำนวน": r[2],
+            "สต๊อกก่อน": r[3],
+            "สต๊อกหลัง": r[4],
+            "รูป": r[5] or "",
+        } for r in hist]
+        st.dataframe(data, use_container_width=True,
+            column_config={"รูป": st.column_config.ImageColumn("รูป", width=IMG_SIZE)})
+    else:
+        st.info("ยังไม่มีประวัติการหมุน")
+    
+
+
+
+
+
+
+
 # ---------------- UI: Admin ----------------
 def admin_dashboard():
     st.title("🛠 แผงผู้ดูแล (StoreManager)")
     st.write(f"สวัสดี **{st.session_state.username}** (ผู้จัดการ)")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "➕ เพิ่มสินค้า",
-        "🔍 ตรวจคำขอเบิก",
-        "🧾 ตรวจคำขอเติมสต๊อก",
-        "📦 สต๊อก",
-        "⚙️ จัดการ",
-        "🗂 ประวัติทั้งหมด",       
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "➕ เพิ่มสินค้า","🔍 ตรวจคำขอ","🧾 ตรวจคำขอเติมสต๊อก","📦 สต๊อก","⚙️ จัดการ","🗂 ประวัติทั้งหมด","🎡 วงล้อสุ่ม"
     ])
     with tab1: add_item_tab()
     with tab2: review_requests_tab()
     with tab3: review_donations_tab()
     with tab4: stock_tab()
     with tab5: manage_items_tab()
-    with tab6: all_logs_tab()        
+    with tab6: all_logs_tab()
+    with tab7: wheel_admin_tab()
+        
+def wheel_admin_tab():
+    st.subheader("🎡 จัดการวงล้อสุ่ม")
+    wheel_id = 1
+
+    # 1) จัดรายการบนวงล้อ
+    st.markdown("#### รายการบนวงล้อ")
+    with closing(get_db_connection()) as con:
+        items = con.execute("SELECT id, name, stock FROM items ORDER BY name").fetchall()
+        wheel_rows = con.execute("""
+            SELECT wi.id, it.name, wi.weight, wi.reward_qty, wi.is_enabled,
+                   COALESCE(wi.label,''), COALESCE(wi.image_path,'')
+            FROM wheel_item wi JOIN items it ON it.id=wi.item_id
+            WHERE wi.wheel_id=? ORDER BY it.name
+        """, (wheel_id,)).fetchall()
+
+        # ใช้สำหรับคำนวณ % จาก weight เฉพาะตัวที่สต๊อกพอและเปิดใช้งาน
+        ok_rows = con.execute("""
+            SELECT wi.weight, wi.reward_qty, it.stock, COALESCE(wi.label,''), it.name
+            FROM wheel_item wi JOIN items it ON it.id=wi.item_id
+            WHERE wi.wheel_id=? AND wi.is_enabled=1 AND it.stock >= wi.reward_qty
+        """, (wheel_id,)).fetchall()
+
+    # แสดง % โดยประมาณจาก weight
+    if ok_rows:
+        total_w = sum(max(0.0, r[0]) for r in ok_rows) or 1.0
+        st.caption("เปอร์เซ็นต์โดยประมาณ (คำนวณจากน้ำหนักของรายการที่ **สต๊อกพอ** ในตอนนี้):")
+        for w, rq, stock, lbl, nm in ok_rows:
+            pct = 100.0 * max(0.0, w) / total_w
+            st.write(f"- {lbl or nm}: ~{pct:.2f}% (ได้ {rq} ชิ้น · คงเหลือ {stock})")
+
+    # แสดงรายการที่มีให้แก้ไข
+    if wheel_rows:
+        for wid, name, w, qty, on, label, img in wheel_rows:
+            with st.expander(f"• {label or name} (weight={w:g}, ได้ {qty}, {'เปิด' if on else 'ปิด'})"):
+                col1, col2 = st.columns([2,1])
+
+                with col1:
+                    new_label = st.text_input("Label (โชว์บนวงล้อ)", value=label, key=f"wlbl_{wid}")
+                    new_weight = st.number_input("น้ำหนัก (ยิ่งมากยิ่งออกง่าย)", value=float(w),
+                                                 min_value=0.0, step=0.1, key=f"ww_{wid}")
+                    new_qty = st.number_input("จำนวนที่ได้ต่อครั้ง", value=int(qty), min_value=1, step=1, key=f"wq_{wid}")
+                    new_on  = st.checkbox("เปิดใช้งาน", value=bool(on), key=f"won_{wid}")
+
+                with col2:
+                    if img:
+                        st.image(img, width=120)
+                    st.caption("อัปโหลดไฟล์หรือใส่ลิงก์รูปก็ได้")
+                    up = st.file_uploader("อัปโหลดรูป", type=["png","jpg","jpeg","webp"], key=f"up_{wid}")
+                    new_img = st.text_input("หรือวาง URL/path รูป", value=img, key=f"wimg_{wid}")
+
+                    # ถ้ามีไฟล์อัปโหลด ให้เซฟลงโฟลเดอร์และใช้ path นั้น
+                    if up is not None:
+                        assets = ensure_assets_dir()  # มีฟังก์ชันนี้อยู่แล้วในไฟล์ของคุณ
+                        safe_name = f"{wid}_{int(time.time())}_{up.name}".replace(" ", "_")
+                        save_path = os.path.join(assets, safe_name)
+                        with open(save_path, "wb") as f:
+                            f.write(up.read())
+                        new_img = save_path
+                        st.success("บันทึกรูปแล้ว")
+                        st.image(new_img, width=120)
+
+                c = st.columns(3)
+                if c[0].button("💾 บันทึก", key=f"wsv_{wid}"):
+                    with closing(get_db_connection()) as con:
+                        con.execute("""
+                            UPDATE wheel_item
+                            SET label=?, weight=?, reward_qty=?, image_path=?, is_enabled=?
+                            WHERE id=?
+                        """, (new_label.strip(), float(new_weight), int(new_qty),
+                              new_img.strip(), 1 if new_on else 0, wid))
+                        con.commit()
+                    st.success("บันทึกแล้ว")
+                    st.rerun()
+
+                if c[1].button("🗑 ลบ", key=f"wdel_{wid}"):
+                    with closing(get_db_connection()) as con:
+                        con.execute("DELETE FROM wheel_item WHERE id=?", (wid,))
+                        con.commit()
+                    st.success("ลบรายการแล้ว")
+                    st.rerun()
+
+    # เพิ่มรายการใหม่
+    st.markdown("#### ➕ เพิ่มรายการใหม่ลงวงล้อ")
+    if not items:
+        st.info("ยังไม่มีสินค้าในคลัง — ไปเพิ่มในแท็บ '➕ เพิ่มสินค้า' ก่อน")
+    else:
+        colA, colB, colC = st.columns([2,1,1])
+        with colA:
+            sel   = st.selectbox("เลือกสินค้า", options=items,
+                                 format_func=lambda r: f"{r[1]} (คงเหลือ {r[2]})")
+            label = st.text_input("Label (ไม่ใส่ = ใช้ชื่อสินค้า)")
+            st.caption("อัปโหลดไฟล์หรือใส่ลิงก์รูปก็ได้")
+            up_new = st.file_uploader("อัปโหลดรูป", type=["png","jpg","jpeg","webp"], key="up_new_wheel")
+            img    = st.text_input("หรือวาง URL/path รูป")
+        with colB:
+            weight = st.number_input("น้ำหนัก", min_value=0.0, value=10.0, step=0.5)
+        with colC:
+            qty    = st.number_input("จำนวนที่ได้ต่อครั้ง", min_value=1, value=1, step=1)
+
+        if st.button("เพิ่มลงวงล้อ", use_container_width=True):
+            img_path = img.strip()
+            if up_new is not None:
+                assets = ensure_assets_dir()
+                safe_name = f"new_{int(time.time())}_{up_new.name}".replace(" ", "_")
+                save_path = os.path.join(assets, safe_name)
+                with open(save_path, "wb") as f:
+                    f.write(up_new.read())
+                img_path = save_path
+
+            with closing(get_db_connection()) as con:
+                con.execute("""
+                    INSERT INTO wheel_item(wheel_id, item_id, label, weight, reward_qty, image_path, is_enabled)
+                    VALUES(?,?,?,?,?,?,1)
+                """, (wheel_id, sel[0], label.strip(), float(weight), int(qty), img_path))
+                con.commit()
+            st.success("เพิ่มลงวงล้อแล้ว")
+            st.rerun()
+
+    st.divider()
+
+    # 2) เติมเครดิตให้ผู้ใช้
+    st.markdown("#### 🎟 เครดิตการหมุน")
+    with closing(get_db_connection()) as con:
+        users = con.execute("SELECT id, username, role FROM users ORDER BY username").fetchall()
+    if users:
+        u = st.selectbox("ผู้ใช้", options=users, format_func=lambda r: f"{r[1]} ({r[2]})")
+        delta = st.number_input("จำนวนเครดิต (+ เพิ่ม / - ลด)", value=1, step=1)
+        if st.button("อัปเดตเครดิต", use_container_width=True):
+            add_credit(int(u[0]), wheel_id, int(delta))
+            st.success("อัปเดตเครดิตสำเร็จ")
+
+    # ดูยอดเครดิตทั้งหมด
+    with closing(get_db_connection()) as con:
+        rows = con.execute("""
+            SELECT u.username, c.credit
+            FROM user_spin_credit c JOIN users u ON u.id=c.user_id
+            WHERE c.wheel_id=?
+            ORDER BY u.username
+        """, (wheel_id,)).fetchall()
+    if rows:
+        st.table([{"ผู้ใช้":r[0], "เครดิต":r[1]} for r in rows])
+
+    st.divider()
+
+    # 3) ประวัติการหมุน
+    st.markdown("#### 🗂 ประวัติการหมุนล่าสุด")
+    with closing(get_db_connection()) as con:
+        hist = con.execute("""
+            SELECT h.id, u.username, i.name, h.reward_qty,
+                   h.before_stock, h.after_stock, h.created_at
+            FROM wheel_spin_history h
+            LEFT JOIN users u ON u.id=h.user_id
+            LEFT JOIN items i ON i.id=h.item_id
+            WHERE h.wheel_id=? ORDER BY h.id DESC LIMIT 200
+        """, (wheel_id,)).fetchall()
+    if hist:
+        st.dataframe([{
+            "ID":x[0], "ผู้ใช้":x[1], "ไอเทม":x[2], "จำนวน":x[3],
+            "ก่อน":x[4], "หลัง":x[5], "เวลา":format_thai_datetime(x[6])
+        } for x in hist], use_container_width=True)
+    else:
+        st.info("ยังไม่มีประวัติการหมุน")
 
 
 
