@@ -1,2 +1,4 @@
 streamlit==1.37.1
-pandas==2.2.2
+# เลือก pandas ให้เข้ากับ Python บน Cloud (ตอนนี้ใช้ 3.13)
+pandas>=2.2.3 ; python_version >= "3.13"
+pandas==2.2.2 ; python_version < "3.13"
