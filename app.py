@@ -10,43 +10,50 @@ def init_db():
     conn.execute('PRAGMA foreign_keys = ON')
     conn.executescript('''
     CREATE TABLE IF NOT EXISTS items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL,
-      stock INTEGER NOT NULL CHECK (stock >= 0)
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        stock INTEGER NOT NULL CHECK (stock >= 0)
     );
 
     CREATE TABLE IF NOT EXISTS requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      item_id INTEGER NOT NULL,
-      qty INTEGER NOT NULL CHECK (qty > 0),
-      reason TEXT,
-      status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
-      returned_qty INTEGER NOT NULL DEFAULT 0,
-      approved_by TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        item_id INTEGER NOT NULL,
+        qty INTEGER NOT NULL CHECK (qty > 0),
+        reason TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+        returned_qty INTEGER NOT NULL DEFAULT 0,
+        approved_by TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
-    -- ✅ ใส่คอลัมน์ให้ครบตั้งแต่แรก
     CREATE TABLE IF NOT EXISTS donations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      item_id INTEGER NOT NULL,
-      qty INTEGER NOT NULL CHECK (qty > 0),
-      note TEXT,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
-      approved_by TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        item_id INTEGER NOT NULL,
+        qty INTEGER NOT NULL CHECK (qty > 0),
+        note TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+        approved_by TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- ✅ เพิ่ม sessions table ให้แน่ใจว่าสร้างอัตโนมัติ
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'user'
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user'
     );
     ''')
-    # ✅ migration เผื่อเครื่องที่มีตารางเก่า
+
+    # migrate กันพัง (กรณี donations เก่า)
     try:
         conn.execute("ALTER TABLE donations ADD COLUMN status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected'))")
     except:
@@ -56,6 +63,7 @@ def init_db():
     except:
         pass
 
+    # admin default
     try:
         admin_password = hashlib.sha256('admin123'.encode()).hexdigest()
         conn.execute('INSERT INTO users (username, password, role) VALUES (?,?,?)',
@@ -64,6 +72,7 @@ def init_db():
     except:
         pass
     conn.close()
+
 
 
 # ---------------- Session token (persist after F5) ----------------
@@ -256,7 +265,6 @@ def request_item_tab():
                 last_id = cur.lastrowid
                 conn.close()
                 st.success(f"📝 สร้างคำขอ #{last_id} ขอเบิก **{item[0]}** จำนวน {qty} (รออนุมัติ)")
-                st.rerun()  # ✅ เห็นรายการทันที
 
 def return_item_tab():
     st.header("🔄 คืนสินค้า")
@@ -302,8 +310,8 @@ def return_item_tab():
                 conn.close()
                 new_remaining = remaining - return_qty
                 st.success(f"↩️ คืนสินค้าคำขอ #{request_id} • {req[9]} จำนวน {return_qty} {'(คืนครบแล้ว)' if new_remaining == 0 else ''}")
-                st.rerun()  # ✅ อัปเดตทันที
-
+                st.rerun()
+                
 def donate_item_tab():
     st.header("💸 ส่งเงินแก๊ง (รออนุมัติ)")
 
