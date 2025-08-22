@@ -683,7 +683,7 @@ def spin_wheel_tab():
                 # ✅ แสดงผลลัพธ์ตรงนี้เลย ไม่ต้อง rerun
                 ph_flash.success(f"คุณได้ **{won}** × {res['qty']} (สต๊อกคงเหลือ {res['stock_after']})")
                 if img_path:
-                    ph_flash.image(img_path, width=IMG_SIZE, caption="รางวัลรอบล่าสุด")
+                    show_image_safe(img_path, width=IMG_SIZE, caption="รางวัลรอบล่าสุด")
 
                 st.balloons()
             else:
