@@ -151,23 +151,27 @@ def init_db():
 
     conn.close()
 
+
 def show_image_safe(img_path: str, width: int = 120, caption: str | None = None):
-    """แสดงรูปจาก URL หรือไฟล์โลคัล; ถ้าไฟล์ไม่มีจะไม่ throw error"""
+    """แสดงรูปจาก URL หรือไฟล์โลคัล; ถ้าไฟล์ไม่มีจะไม่พัง"""
     if not img_path:
         return
+    p = str(img_path).strip()
     try:
-        if img_path.startswith(("http://", "https://")):
-            show_image_safe()(img_path, width=width, caption=caption)
+        # URL/ data-URI
+        if p.startswith(("http://", "https://", "data:image")):
+            st.image(p, width=width, caption=caption)
             return
-        p = Path(img_path)
-        if not p.exists():
-            p = Path(".") / img_path  # ลองคลังปัจจุบัน
-        if p.exists():
-            show_image_safe()(str(p), width=width, caption=caption)
-        else:
-            st.caption(f"ไม่พบรูป: {img_path}")
+        # ไฟล์โลคัล (ลองหลาย relative paths)
+        candidates = [p, os.path.join(".", p), str((Path(__file__).parent / p))]
+        for cand in candidates:
+            if os.path.exists(cand):
+                st.image(cand, width=width, caption=caption)
+                return
+        st.caption(f"ไม่พบรูป: {p}")
     except Exception:
         st.caption("แสดงรูปไม่สำเร็จ")
+
 
 # ---------------- Session token (persist after F5) ----------------
 import uuid
@@ -634,16 +638,7 @@ def spin_wheel_tab():
             pct = (w / total_w) * 100.0 if stock >= qty and w > 0 and total_w > 0 else 0
             with grid[i % 3]:
                 with st.container(border=True):
-                    if img:
-                        try:
-                            if img.startswith(("http://", "https://")):
-                                show_image_safe()(img, width=IMG_SIZE)
-                            elif os.path.exists(img):
-                                show_image_safe()(img, width=IMG_SIZE)
-                            elif os.path.exists(os.path.join(".", img)):
-                                show_image_safe()(os.path.join(".", img), width=IMG_SIZE)
-                        except:
-                            st.caption("แสดงรูปไม่สำเร็จ")
+                    show_image_safe(img, width=IMG_SIZE)
                     st.markdown(f"**{label or name}**")
                     st.caption(f"โอกาศอยู่ในมือคุณ ผีพนันทั้งหลาย")
                     # st.caption(f"โอกาศได้: {w:g} %")
